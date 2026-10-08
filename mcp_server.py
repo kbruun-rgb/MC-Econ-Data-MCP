@@ -85,13 +85,41 @@ class DbTokenVerifier(TokenVerifier):
                     """,
                     (token,),
                 ).fetchone()
+                if row is not None:
+                    user_id, email, expires_at = row
+                    if expires_at is not None:
+                        if expires_at.tzinfo is None:
+                            expires_at = expires_at.replace(tzinfo=timezone.utc)
+                        if datetime.now(timezone.utc) < expires_at:
+                            return AccessToken(
+                                token=token,
+                                client_id=str(user_id),
+                                scopes=[],
+                                expires_at=int(expires_at.timestamp()),
+                                subject=email,
+                            )
+
+                # Not a manual key (or it's expired) -- check the OAuth path
+                # (Claude Desktop / claude.ai, issued by the main site's
+                # /oauth/token; see app/oauth_server.py there). Separate
+                # table, additive only: both paths go through this one
+                # verifier so either kind of credential works.
+                row = conn.execute(
+                    """
+                    SELECT ot.access_token_expires_at, ot.revoked, u.id, u.email
+                    FROM oauth_token ot
+                    JOIN "user" u ON u.id = ot.user_id
+                    WHERE ot.access_token = %s
+                    """,
+                    (token,),
+                ).fetchone()
         except psycopg.OperationalError as e:
             print(f"verify_token: DB unavailable ({e}) -- rejecting token")
             return None
         if row is None:
             return None
-        user_id, email, expires_at = row
-        if expires_at is None:
+        expires_at, revoked, user_id, email = row
+        if revoked or expires_at is None:
             return None
         if expires_at.tzinfo is None:
             expires_at = expires_at.replace(tzinfo=timezone.utc)
