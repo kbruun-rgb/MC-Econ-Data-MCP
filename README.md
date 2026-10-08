@@ -74,6 +74,25 @@ Not yet deployed. To stand this up for real:
    the plan for why), but they were flagged as a pre-existing loose end
    while researching this.
 
+## OAuth support for Claude Desktop / claude.ai (added 2026-10-08)
+
+`DbTokenVerifier.verify_token` now checks two tables: `user.api_token` (the
+manual key, Claude Code) and a new `oauth_token` table, populated by a real
+OAuth 2.0 authorization server hand-rolled as plain Flask routes on the
+*main site* (`app/oauth_server.py` there) -- RFC 8414 metadata, RFC 7591
+Dynamic Client Registration, an `/authorize` consent step, and PKCE-verified
+`/token` code exchange + refresh rotation. The issuer stays on the main
+site's domain (already baked into this server's advertised
+`oauth-protected-resource` metadata); this service only gained the second
+read path. Fully additive -- the Claude Code bearer-token path is untouched.
+Real end-to-end test (2026-10-08): registered a client, drove the full
+authorize->consent->token-exchange flow against production, and confirmed
+the resulting access token worked against this live deployed server
+(`list_datasets`/`query_dataset`), with a garbage token still rejected.
+Test user and all OAuth rows deleted afterward, production back to
+baseline (19 users, 0 oauth_client/oauth_token/oauth_authorization_code
+rows).
+
 ## What's been tested so far (no production DB touched)
 
 - R2 catalog listing, dataset download, DuckDB describe/query -- against
