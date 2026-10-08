@@ -1,0 +1,5 @@
+mcp==1.28.1
+duckdb==1.5.4
+boto3
+python-dotenv
+psycopg[binary]
