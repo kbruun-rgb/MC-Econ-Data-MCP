@@ -15,6 +15,7 @@ Requires in its environment (.env, same convention as the main site's
 config.py): DATABASE_URL, R2_ENDPOINT_URL, R2_ACCESS_KEY_ID,
 R2_SECRET_ACCESS_KEY, R2_BUCKET_NAME, MCP_PUBLIC_URL.
 """
+import contextlib
 import os
 import re
 import tempfile
@@ -245,21 +246,47 @@ def _download_dataset(key: str) -> str:
     return path
 
 
-def _materialized_connection(path: str) -> "duckdb.DuckDBPyConnection":
-    """Loads one CSV into a real in-memory TABLE (not a view -- a view would
-    keep re-reading the file, which matters for what comes next), then
-    disables all file/network access on this connection. Confirmed by
-    testing: a plain SELECT can otherwise call DuckDB's own table functions
-    (read_csv_auto, read_parquet, the httpfs extension, etc.) to read any
-    file the server process can see, e.g. `SELECT * FROM
-    read_csv_auto('/etc/passwd')` -- a keyword blocklist alone can't catch
-    this since none of those are write/DDL keywords. This is the real
-    control; `_validate_select_only` is just a fast first-pass reject.
+@contextlib.contextmanager
+def _materialized_dataset(key: str):
+    """Downloads one dataset's CSV and loads it into a real TABLE (not a
+    view -- a view would keep re-reading the file, which matters for what
+    comes next) on a disk-backed DuckDB database, then disables all file/
+    network access on that connection. Confirmed by testing: a plain SELECT
+    can otherwise call DuckDB's own table functions (read_csv_auto,
+    read_parquet, the httpfs extension, etc.) to read any file the server
+    process can see, e.g. `SELECT * FROM read_csv_auto('/etc/passwd')` -- a
+    keyword blocklist alone can't catch this since none of those are
+    write/DDL keywords. This is the real control; `_validate_select_only`
+    is just a fast first-pass reject.
+
+    File-backed (a scratch .duckdb file), not `:memory:` -- confirmed
+    2026-10-09: loading a 443MB CSV into an in-memory DuckDB table OOM'd
+    and crashed the whole Render instance (real production incident, not a
+    hypothetical). A file-backed database lets DuckDB spill to disk
+    instead of requiring the whole table resident in RAM; `memory_limit`
+    is also set explicitly below since a container's actual memory cap
+    isn't always what DuckDB would otherwise auto-detect from the host.
+    Cleans up both the downloaded CSV and the scratch .duckdb file on
+    exit, success or not -- used as `with _materialized_dataset(key) as
+    con:` so neither call site has to remember both of those itself.
     """
-    con = duckdb.connect(":memory:")
-    con.execute(f"CREATE TABLE data AS SELECT * FROM read_csv_auto('{path}')")
-    con.execute("SET enable_external_access=false")
-    return con
+    csv_path = _download_dataset(key)
+    fd, db_path = tempfile.mkstemp(suffix=".duckdb")
+    os.close(fd)
+    os.remove(db_path)  # duckdb.connect() creates this file itself
+    con = None
+    try:
+        con = duckdb.connect(db_path)
+        con.execute("SET memory_limit='350MB'")
+        con.execute(f"CREATE TABLE data AS SELECT * FROM read_csv_auto('{csv_path}')")
+        con.execute("SET enable_external_access=false")
+        yield con
+    finally:
+        if con is not None:
+            con.close()
+        os.remove(csv_path)
+        if os.path.exists(db_path):
+            os.remove(db_path)
 
 
 _SELECT_ONLY_RE = re.compile(r"^\s*SELECT\b", re.IGNORECASE)
@@ -332,13 +359,9 @@ def describe_dataset(dataset: str) -> str:
     catalog = _list_catalog()
     if dataset not in catalog:
         return f"Unknown dataset: {dataset!r}. Call list_datasets() for valid IDs."
-    path = _download_dataset(catalog[dataset]["key"])
-    try:
-        con = _materialized_connection(path)
+    with _materialized_dataset(catalog[dataset]["key"]) as con:
         columns = con.execute("DESCRIBE data").fetchall()
         row_count = con.execute("SELECT COUNT(*) FROM data").fetchone()[0]
-    finally:
-        os.remove(path)
     lines = [f"{dataset}: {row_count} rows\n", "Columns:"]
     for col_name, col_type, *_rest in columns:
         lines.append(f"  {col_name:30s} {col_type}")
@@ -366,17 +389,13 @@ def query_dataset(dataset: str, sql: str) -> str:
     catalog = _list_catalog()
     if dataset not in catalog:
         return f"Unknown dataset: {dataset!r}. Call list_datasets() for valid IDs."
-    path = _download_dataset(catalog[dataset]["key"])
-    try:
-        con = _materialized_connection(path)
+    with _materialized_dataset(catalog[dataset]["key"]) as con:
         try:
             result = con.execute(sql)
         except duckdb.PermissionException:
             return "Query rejected: file/network access is disabled on this connection -- only the loaded dataset table ('data') can be queried."
         rows = result.fetchmany(1000)
         columns = [d[0] for d in result.description]
-    finally:
-        os.remove(path)
     if not rows:
         return "(no rows)"
     lines = ["\t".join(columns)]
